@@ -15,6 +15,7 @@ import torch.nn as nn
 from shared.losses.adversarial_loss import AdversarialLoss
 from shared.losses.fusion_loss       import FusionLoss
 from shared.losses.latency_loss      import LatencyLoss
+import lpips
 
 
 class GeneratorLossEngine(nn.Module):
@@ -49,6 +50,10 @@ class GeneratorLossEngine(nn.Module):
         self.adv_loss     = AdversarialLoss(loss_type=adv_loss_type)
         self.fusion_loss  = FusionLoss(use_perceptual=use_perceptual, use_l1=use_l1)
         self.latency_loss = LatencyLoss()
+        
+        self.lpips_loss = lpips.LPIPS(net='vgg')
+        for param in self.lpips_loss.parameters():
+            param.requires_grad = False
 
     def forward(
         self,
@@ -70,6 +75,10 @@ class GeneratorLossEngine(nn.Module):
         ladv     = self.adv_loss(fake_scores)
         lfusion  = self.fusion_loss(fused, reference)
         llatency = self.latency_loss(tl_pred)
+        
+        # Add LPIPS to fusion loss component (lpips expects [-1, 1] inputs)
+        lpips_val = self.lpips_loss(fused, reference).mean()
+        lfusion = lfusion + lpips_val
 
         total = (
             self.lambda_adv     * ladv     +
@@ -83,3 +92,4 @@ class GeneratorLossEngine(nn.Module):
             "lfusion":  lfusion,
             "llatency": llatency,
         }
+

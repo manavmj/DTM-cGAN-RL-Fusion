@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Build files
+*.egg-info/
+
+# Outputs
+outputs/
+
+# Model weights
+*.pt
+*.pth
+
+# Installers
+*.exe
+
+# Virtual environment
+venv/

@@ -59,3 +59,9 @@ early_stopping:
   mode: max
 
 max_grad_norm: 1.0
+
+loss_weights:
+  lambda_adv: 1.0
+  lambda_fusion: 8.0
+  lambda_latency: 2.0
+  lambda_task: 5.0
