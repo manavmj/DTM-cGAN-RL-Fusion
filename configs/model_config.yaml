@@ -1,0 +1,86 @@
+# ============================================================
+# model_config.yaml — Architecture Hyperparameters
+# DTM-RL-GAN: Dynamic Tri-Modal Reinforcement-Learning-Guided Generative Fusion for RGB–Thermal–LiDAR Perception
+# ============================================================
+
+modalities:
+  rgb:     { in_channels: 3, image_size: [256, 256] }
+  thermal: { in_channels: 1, image_size: [256, 256] }
+  lidar:   { in_channels: 1, image_size: [256, 256] }
+
+encoder:
+  backbone: "resnet34"        # resnet18 | resnet34 | resnet50
+  pretrained: true
+  embed_dim: 256
+
+confidence_estimator:
+  hidden_dim: 128
+  dropout: 0.1
+
+scene_graph:
+  node_feat_dim: 256
+  hidden_dim: 256
+  num_gnn_layers: 3
+  num_heads: 4
+  graph_embed_dim: 256
+
+knowledge_bank:
+  num_slots: 64
+  key_dim: 256
+  value_dim: 256
+  retrieval_heads: 4
+
+state_builder:
+  # St = [E_rgb(256) | E_th(256) | E_li(256) | C_rgb(1) | C_th(1) | C_li(1)
+  #        | G_scene(256) | K_t(256) | perf_metrics(5)]
+  state_dim: 1286
+
+ppo:
+  state_dim: 1286
+  action_discrete_n: 3       # 0=Light, 1=Deep, 2=Both
+  action_continuous_n: 3     # modality blend weights [w_rgb, w_th, w_li]
+  actor_hidden:  [512, 256, 128]
+  critic_hidden: [512, 256, 128]
+  dropout: 0.1
+  log_std_init: -0.5
+
+generator:
+  stem_channels: 64
+  base_channels: 64
+  out_channels: 3
+
+  deep_fusion_block:
+    channels: [64, 128, 256, 512]
+    num_scales: 4
+    attention_heads: 8
+    use_se: true
+
+  light_fusion_block:
+    channels: [32, 64, 128]
+    depthwise: true
+    attention_heads: 4
+
+  cross_attention:
+    embed_dim: 256
+    num_heads: 8
+    ff_dim: 512
+    dropout: 0.1
+
+discriminator:
+  fusion_quality_critic:
+    channels: [64, 128, 256]
+    use_spectral_norm: true
+
+  latency_critic:
+    hidden: [256, 128, 64]
+
+
+
+loss_weights:
+  lambda_adv:     1.0
+  lambda_fusion:  10.0
+  lambda_latency: 0.5
+
+reward_weights:
+  alpha: 1.0    # Qt  — fusion quality
+  gamma: 0.5    # Tl  — latency penalty

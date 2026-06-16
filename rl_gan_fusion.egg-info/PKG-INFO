@@ -1,0 +1,152 @@
+Metadata-Version: 2.4
+Name: rl_gan_fusion
+Version: 0.1.0
+Summary: DTM-RL-GAN: Dynamic Tri-Modal Reinforcement-Learning-Guided Generative Fusion
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.1.0
+Requires-Dist: torchvision>=0.16.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: Pillow>=10.0.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: tensorboard>=2.14.0
+Requires-Dist: scipy>=1.11.0
+Requires-Dist: tqdm>=4.66.0
+Requires-Dist: matplotlib>=3.8.0
+Requires-Dist: ultralytics>=8.0.0
+Requires-Dist: pytest>=7.4.0
+Requires-Dist: pytest-cov>=4.1.0
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# DTM-RL-GAN: Dynamic Tri-Modal Reinforcement-Learning-Guided Generative Fusion for RGB–Thermal–LiDAR Perception
+
+A dual-loop training framework combining **Proximal Policy Optimization (PPO)** and
+**Generative Adversarial Networks (GAN)** for adaptive multi-modal image fusion
+across RGB, Thermal, and LiDAR modalities.
+
+---
+
+## Architecture
+
+```
+Loop 1 (RL)  — PPO agent learns WHEN to use deep vs. light fusion
+Loop 2 (GAN) — Generator learns HOW to fuse modalities with quality
+```
+
+### Key Modules
+
+| Module | Role |
+|--------|------|
+| `fusion/` | Pure fusion: stems, blocks, attention, topology |
+| `rl/` | PPO: actor, critic, rollout buffer, update |
+| `gan/` | Generator G + Multi-Critic Discriminator D |
+| `scene/` | Scene graph network, knowledge bank, state builder |
+| `shared/` | Encoder, losses, metrics, reward engine |
+
+---
+
+## Installation
+
+```bash
+git clone <repo>
+cd rl_gan_fusion
+pip install -e .
+```
+
+---
+
+## Quick Start
+
+```bash
+# Train
+python main.py train --model-config configs/model_config.yaml \
+                     --train-config configs/training_config.yaml \
+                     --data-config  configs/data_config.yaml
+
+# Evaluate
+python main.py eval --checkpoint outputs/checkpoints/best.pt
+
+# Infer on a single triplet
+python main.py infer --rgb path/to/rgb.png \
+                     --thermal path/to/thermal.png \
+                     --lidar path/to/lidar.png \
+                     --checkpoint outputs/checkpoints/best.pt
+
+# Export Generator backbone to ONNX
+python scripts/export_onnx.py --checkpoint outputs/checkpoints/best.pt \
+                               --output outputs/generator_backbone.onnx
+```
+
+---
+
+## Project Structure
+
+```
+rl_gan_fusion/
+├── configs/          # YAML hyperparameters
+├── data/             # Dataset + transforms + DataLoader builders
+├── shared/           # Encoder, losses, metrics, reward (zero inter-module deps)
+├── scene/            # Scene graph + knowledge bank + state builder
+├── fusion/           # Stems, Deep/Light blocks, cross-attention, topology
+├── rl/               # PPO agent, rollout buffer, PPO update
+├── gan/              # Generator G, Multi-Critic Discriminator D
+├── training/         # RL trainer, GAN trainer, master trainer
+├── inference/        # End-to-end inference pipeline
+├── utils/            # Config loader, TensorBoard logger, checkpoint, seed, viz
+├── tests/            # Unit tests + integration tests
+│   └── integration/  # Synthetic training run tests
+└── scripts/          # Dataset prep, ONNX export, latency benchmark
+```
+
+---
+
+## Reward Function
+
+```
+R = α·Qt + β·Dacc − γ·Tl
+```
+
+| Symbol | Meaning |
+|--------|---------|
+| Qt | Fusion quality (EN, MI, AG, SF, SSIM) |
+| Dacc | Task accuracy (mAP proxy) |
+| Tl | Latency (FLOPs proxy) |
+| α, β, γ | Tunable weights (see `model_config.yaml`) |
+
+---
+
+## Generator Loss
+
+```
+L_G = λ1·L_adv + λ2·L_fusion + λ3·L_latency + λ4·L_task
+```
+
+---
+
+## Running Tests
+
+```bash
+# Unit tests
+pytest tests/ -v --ignore=tests/integration
+
+# Integration test (synthetic training loop)
+pytest tests/integration/ -v
+
+# All tests with coverage
+pytest tests/ --cov=. --cov-report=html
+```
+
+---
+
+## TensorBoard
+
+```bash
+tensorboard --logdir outputs/logs/
+```
