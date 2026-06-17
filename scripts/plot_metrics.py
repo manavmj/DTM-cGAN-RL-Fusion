@@ -1,8 +1,18 @@
 import os
-import pandas as pd
+import sys
+
+# pyrefly: ignore [missing-import]
 import matplotlib.pyplot as plt
-import seaborn as sns
+# pyrefly: ignore [missing-import]
 import numpy as np
+# pyrefly: ignore [missing-import]
+import pandas as pd
+# pyrefly: ignore [missing-import]
+import seaborn as sns
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from utils.config import load_config
 
 sns.set_theme(style="whitegrid")
 
@@ -69,9 +79,9 @@ def main():
     # 1. Evaluate Metrics (Comparison)
     if os.path.exists("outputs/eval_results_test.csv"):
         eval_df = pd.read_csv("outputs/eval_results_test.csv")
+        print("Generating performance comparisons...")
         
-        # Aggregate by Method
-        agg_df = eval_df.groupby("Method").mean().reset_index()
+        agg_df = eval_df.groupby("Method").mean(numeric_only=True).reset_index()
         
         # Add external baseline placeholders
         external_df = get_external_baselines()

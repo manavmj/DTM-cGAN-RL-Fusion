@@ -9,7 +9,7 @@ num_workers: 4
 pin_memory: true
 use_amp: true
 
-num_epochs: 100
+num_epochs: 5
 gan_warmup_epochs: 5          # Pure GAN training before RL activates
 
 batch_size: 8

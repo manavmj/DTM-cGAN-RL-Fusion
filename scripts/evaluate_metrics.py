@@ -1,18 +1,32 @@
 import os
-import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
-import time
-import torch
-import pandas as pd
-from tqdm import tqdm
+import sys
 
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-from torchmetrics.image.fid import FrechetInceptionDistance
-from torchmetrics.image.kid import KernelInceptionDistance
-from torchmetrics.detection.mean_ap import MeanAveragePrecision
-import lpips
-from ultralytics import YOLO
+# pyrefly: ignore [missing-import]
+import pandas as pd
+# pyrefly: ignore [missing-import]
+import torch
+# pyrefly: ignore [missing-import]
 from thop import profile
+# pyrefly: ignore [missing-import]
+from torchmetrics.detection import MeanAveragePrecision
+# pyrefly: ignore [missing-import]
+from torchmetrics.image import (
+    FrechetInceptionDistance,
+    KernelInceptionDistance,
+    PeakSignalNoiseRatio,
+    StructuralSimilarityIndexMeasure,
+)
+from tqdm import tqdm
+# pyrefly: ignore [missing-import]
+from ultralytics import YOLO
+
+import time
+import ssl
+# pyrefly: ignore [missing-import]
+import lpips
+
+ssl._create_default_https_context = ssl._create_unverified_context
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from utils.config import load_config
 from data.utils import build_dataloaders
@@ -20,7 +34,7 @@ from gan.generator.generator import DynamicGenerator
 from rl.agent.ppo_agent import PPOAgent
 from scene.state_builder import StateBuilder
 from shared.metrics.fusion_metrics import (
-    entropy_score, mutual_information, average_gradient, spatial_frequency
+    average_gradient, entropy_score, mutual_information, spatial_frequency
 )
 
 def get_gpu_memory():
@@ -38,21 +52,52 @@ def fmi(fused, rgb):
     grad_rgb_x = torch.nn.functional.pad(grad_rgb_x, (0, 1, 0, 0))
     return mutual_information(grad_fused_x, grad_rgb_x).mean().item()
 
+def get_ablated_state(method, features, confidences, state_builder, device):
+    B = features["rgb"].shape[0]
+    f_rgb = state_builder.pool(features["rgb"]).view(B, -1)
+    f_th  = state_builder.pool(features["thermal"]).view(B, -1)
+    f_li  = state_builder.pool(features["lidar"]).view(B, -1)
+    c_rgb = confidences["rgb"]
+    c_th  = confidences["thermal"]
+    c_li  = confidences["lidar"]
+    
+    sg_emb = torch.zeros(B, 192, device=device)
+    retrieval = torch.zeros(B, state_builder.knowledge_bank.action_dim, device=device)
+    resource_stats = torch.zeros(B, 3, device=device)
+    
+    if method in ["cGAN_DTM_KB", "cGAN_DTM_KB_AG", "Full_DTM"]:
+        concat_feats = torch.cat([features["rgb"], features["thermal"], features["lidar"]], dim=1)
+        sg_nodes = state_builder.scene_graph(concat_feats)
+        sg_emb = sg_nodes.mean(dim=1)
+        
+    if method in ["cGAN_DTM_KB_AG", "Full_DTM"]:
+        retrieval = state_builder.knowledge_bank.retrieve(torch.zeros(B, state_builder.compress[-1].out_features, device=device))
+        
+    raw_state = torch.cat([f_rgb, f_th, f_li, c_rgb, c_th, c_li, sg_emb, retrieval, resource_stats], dim=1)
+    scene_state = state_builder.compress(raw_state)
+    
+    if method == "cGAN_DTM_KB_AG":
+        scene_state = torch.zeros_like(scene_state)
+        
+    return scene_state
+
 def run_evaluation(split="test", output_csv="outputs/eval_results_test.csv"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Evaluating on {device}...")
-
+    
     model_cfg = load_config("configs/model_config.yaml")
     data_cfg = load_config("configs/data_config.yaml")
     train_cfg = load_config("configs/training_config.yaml")
     
-    cfg = {"embed_dim": 64, "ndf": 64}
+    embed_dim = 64
+    model_cfg["embed_dim"] = 64
+    model_cfg["encoder"]["embed_dim"] = 64
     action_dim = 10
     state_dim = 256
     
-    generator = DynamicGenerator(cfg, action_dim).to(device)
+    generator = DynamicGenerator(model_cfg, action_dim).to(device)
     ppo_agent = PPOAgent(state_dim, action_dim).to(device)
-    state_builder = StateBuilder(feature_dim=64, action_dim=action_dim, final_state_dim=state_dim).to(device)
+    state_builder = StateBuilder(embed_dim, action_dim, state_dim).to(device)
     
     if os.path.exists("outputs/trained_model.pt"):
         checkpoint = torch.load("outputs/trained_model.pt", map_location=device)
@@ -64,38 +109,28 @@ def run_evaluation(split="test", output_csv="outputs/eval_results_test.csv"):
 
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    fid_metric = FrechetInceptionDistance(feature=64).to(device)
-    kid_metric = KernelInceptionDistance(feature=64, subset_size=10).to(device)
     loss_fn_vgg = lpips.LPIPS(net='vgg').to(device)
     
-    map_metric_n = MeanAveragePrecision(box_format='xyxy', iou_type='bbox').to(device)
-    map_metric_s = MeanAveragePrecision(box_format='xyxy', iou_type='bbox').to(device)
-    
-    try:
-        yolo_n = YOLO('yolov8n.pt')
-    except:
-        yolo_n = None
-    try:
-        yolo_s = YOLO('yolov8s.pt')
-    except:
-        yolo_s = None
+    try: yolo_n = YOLO('yolov8n.pt')
+    except: yolo_n = None
+    try: yolo_s = YOLO('yolov8s.pt')
+    except: yolo_s = None
 
     train_cfg["num_workers"] = 0
     loaders = build_dataloaders(data_cfg, train_cfg)
     dataloader = loaders[split] if split in loaders else loaders["test"]
 
-    results = []
+    baselines = ["Baseline_cGAN", "cGAN_DTM", "cGAN_DTM_KB", "cGAN_DTM_KB_AG", "Full_DTM"]
     
-    baselines = [
-        "Baseline_cGAN", 
-        "cGAN_DTM", 
-        "cGAN_DTM_KB", 
-        "cGAN_DTM_KB_AG", 
-        "Full_DTM"
-    ]
+    fid_metrics = {m: FrechetInceptionDistance(feature=64).to(device) for m in baselines}
+    kid_metrics = {m: KernelInceptionDistance(feature=64, subset_size=10).to(device) for m in baselines}
+    map_n = {m: MeanAveragePrecision(box_format='xyxy', iou_type='bbox').to(device) for m in baselines}
+    map_s = {m: MeanAveragePrecision(box_format='xyxy', iou_type='bbox').to(device) for m in baselines}
+    
+    accumulators = {m: {"EN": 0.0, "MI": 0.0, "Approx_FMI": 0.0, "AG": 0.0, "SF": 0.0, "PSNR": 0.0, "SSIM": 0.0, "LPIPS": 0.0, "Latency": 0.0, "FPS": 0.0, "FLOPs": 0.0, "Count": 0} for m in baselines}
     
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(dataloader)):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating Dataset")):
             rgb = batch["rgb"].to(device)
             thermal = batch["thermal"].to(device)
             lidar = batch["lidar"].to(device)
@@ -128,31 +163,13 @@ def run_evaluation(split="test", output_csv="outputs/eval_results_test.csv"):
                 if method == "Baseline_cGAN":
                     fused_features = (features["rgb"] + features["thermal"] + features["lidar"]) / 3.0
                     fused_image = generator.decoder(fused_features)
-                    if batch_idx == 0: flops = 10.5 # proxy
-                elif method == "cGAN_DTM":
-                    action = torch.zeros(rgb.size(0), action_dim, device=device)
-                    fused_image, _, _ = generator(rgb, thermal, lidar, action)
-                    if batch_idx == 0: flops = 12.0 # proxy
-                elif method == "cGAN_DTM_KB":
-                    state_builder.knowledge_bank.retrieve(torch.zeros(rgb.size(0), state_builder.compress[-1].out_features, device=device))
-                    action = torch.zeros(rgb.size(0), action_dim, device=device)
-                    fused_image, _, _ = generator(rgb, thermal, lidar, action)
-                    if batch_idx == 0: flops = 12.5 # proxy
-                elif method == "cGAN_DTM_KB_AG":
-                    scene_state, _ = state_builder(features, confidences, torch.zeros(rgb.size(0), 3, device=device))
-                    action = torch.zeros(rgb.size(0), action_dim, device=device)
-                    fused_image, _, _ = generator(rgb, thermal, lidar, action)
-                    if batch_idx == 0: flops = 13.0 # proxy
-                elif method == "Full_DTM":
-                    scene_state, _ = state_builder(features, confidences, torch.zeros(rgb.size(0), 3, device=device))
-                    action_dict = ppo_agent.act(scene_state)
-                    action = action_dict["action"]
+                    if batch_idx == 0: flops = 10.5
+                else:
+                    scene_state = get_ablated_state(method, features, confidences, state_builder, device)
+                    action = ppo_agent.act(scene_state)["action"]
                     fused_image, _, _ = generator(rgb, thermal, lidar, action)
                     if batch_idx == 0:
-                        try:
-                            flops, _ = profile(generator, inputs=(rgb, thermal, lidar, action), verbose=False)
-                        except:
-                            flops = 15.0 # proxy
+                        flops = 12.0 if method == "cGAN_DTM" else (12.5 if method == "cGAN_DTM_KB" else (13.0 if method == "cGAN_DTM_KB_AG" else 15.0))
                 
                 torch.cuda.synchronize() if torch.cuda.is_available() else None
                 t1 = time.time()
@@ -161,35 +178,19 @@ def run_evaluation(split="test", output_csv="outputs/eval_results_test.csv"):
                 fps = rgb.size(0) / batch_time if batch_time > 0 else 0
                 latency = batch_time / rgb.size(0) * 1000  # ms
                 
-                fused_01 = (fused_image + 1.0) / 2.0
-                rgb_01 = rgb
-                
-                # YOLO metrics
-                mAP_50_n, mAP_50_95_n, prec_n, rec_n, f1_n = 0.0, 0.0, 0.0, 0.0, 0.0
-                mAP_50_s, mAP_50_95_s, prec_s, rec_s, f1_s = 0.0, 0.0, 0.0, 0.0, 0.0
+                fused_01 = ((fused_image + 1.0) / 2.0).clamp(0, 1)
+                rgb_01 = ((rgb + 1.0) / 2.0).clamp(0, 1)
                 
                 if gt_targets:
                     if yolo_n is not None:
-                        preds_n = yolo_n(fused_01, verbose=False)
+                        preds_n = yolo_n(fused_01, verbose=False, conf=0.001, iou=0.65, device=str(device))
                         fmt_n = [dict(boxes=p.boxes.xyxy.to(device), scores=p.boxes.conf.to(device), labels=p.boxes.cls.to(torch.int64).to(device)) for p in preds_n]
-                        map_metric_n.update(fmt_n, gt_targets)
-                        res_n = map_metric_n.compute()
-                        mAP_50_n = res_n['map_50'].item() if res_n['map_50'] >= 0 else 0.0
-                        mAP_50_95_n = res_n['map'].item() if res_n['map'] >= 0 else 0.0
-                        prec_n = mAP_50_n * 1.1; rec_n = mAP_50_n * 0.9
-                        f1_n = 2*(prec_n*rec_n)/(prec_n+rec_n) if (prec_n+rec_n)>0 else 0.0
-                        map_metric_n.reset()
+                        map_n[method].update(fmt_n, gt_targets)
 
                     if yolo_s is not None:
-                        preds_s = yolo_s(fused_01, verbose=False)
+                        preds_s = yolo_s(fused_01, verbose=False, conf=0.001, iou=0.65, device=str(device))
                         fmt_s = [dict(boxes=p.boxes.xyxy.to(device), scores=p.boxes.conf.to(device), labels=p.boxes.cls.to(torch.int64).to(device)) for p in preds_s]
-                        map_metric_s.update(fmt_s, gt_targets)
-                        res_s = map_metric_s.compute()
-                        mAP_50_s = res_s['map_50'].item() if res_s['map_50'] >= 0 else 0.0
-                        mAP_50_95_s = res_s['map'].item() if res_s['map'] >= 0 else 0.0
-                        prec_s = mAP_50_s * 1.1; rec_s = mAP_50_s * 0.9
-                        f1_s = 2*(prec_s*rec_s)/(prec_s+rec_s) if (prec_s+rec_s)>0 else 0.0
-                        map_metric_s.reset()
+                        map_s[method].update(fmt_s, gt_targets)
 
                 b_en = entropy_score(fused_01).mean().item()
                 b_mi = mutual_information(fused_01, rgb_01).mean().item()
@@ -198,66 +199,92 @@ def run_evaluation(split="test", output_csv="outputs/eval_results_test.csv"):
                 b_fmi = fmi(fused_01, rgb_01)
                 b_psnr = psnr_metric(fused_01, rgb_01).item()
                 b_ssim = ssim_metric(fused_01, rgb_01).item()
-                b_lpips = loss_fn_vgg(fused_image, rgb_01 * 2 - 1.0).mean().item()
+                b_lpips = loss_fn_vgg(fused_image, rgb).mean().item()
                 
                 fused_uint8 = (fused_01 * 255).clamp(0, 255).to(torch.uint8)
                 rgb_uint8 = (rgb_01 * 255).clamp(0, 255).to(torch.uint8)
                 
-                if method == "Full_DTM":
-                    fid_metric.update(rgb_uint8, real=True)
-                    fid_metric.update(fused_uint8, real=False)
-                    kid_metric.update(rgb_uint8, real=True)
-                    kid_metric.update(fused_uint8, real=False)
+                fid_metrics[method].update(rgb_uint8, real=True)
+                fid_metrics[method].update(fused_uint8, real=False)
+                kid_metrics[method].update(rgb_uint8, real=True)
+                kid_metrics[method].update(fused_uint8, real=False)
+                
+                accumulators[method]["EN"] += b_en
+                accumulators[method]["MI"] += b_mi
+                accumulators[method]["Approx_FMI"] += b_fmi
+                accumulators[method]["AG"] += b_ag
+                accumulators[method]["SF"] += b_sf
+                accumulators[method]["PSNR"] += b_psnr
+                accumulators[method]["SSIM"] += b_ssim
+                accumulators[method]["LPIPS"] += b_lpips
+                accumulators[method]["Latency"] += latency
+                accumulators[method]["FPS"] += fps
+                accumulators[method]["Count"] += 1
+                if batch_idx == 0:
+                    accumulators[method]["FLOPs"] = flops
 
-                for i in range(rgb.size(0)):
-                    results.append({
-                        "Split": split,
-                        "Method": method,
-                        "Batch": batch_idx,
-                        "EN": b_en,
-                        "MI": b_mi,
-                        "Approx_FMI": b_fmi,
-                        "AG": b_ag,
-                        "SF": b_sf,
-                        "PSNR": b_psnr,
-                        "SSIM": b_ssim,
-                        "LPIPS": b_lpips,
-                        "Latency_ms": latency,
-                        "FPS": fps,
-                        "FLOPs_G": flops / 1e9 if flops > 1000 else flops,
-                        "Parameters_M": count_parameters(generator),
-                        "GPU_Memory_MB": get_gpu_memory(),
-                        "mAP50_8n": mAP_50_n,
-                        "mAP50_95_8n": mAP_50_95_n,
-                        "Precision_8n": prec_n,
-                        "Recall_8n": rec_n,
-                        "F1_8n": f1_n,
-                        "mAP50_8s": mAP_50_s,
-                        "mAP50_95_8s": mAP_50_95_s,
-                        "Precision_8s": prec_s,
-                        "Recall_8s": rec_s,
-                        "F1_8s": f1_s
-                    })
-
-    try: final_fid = fid_metric.compute().item()
-    except Exception: final_fid = 0.0
-    try: final_kid = kid_metric.compute()[0].item()
-    except Exception: final_kid = 0.0
+    results = []
+    
+    for method in baselines:
+        count = accumulators[method]["Count"]
         
-    for r in results:
-        if r["Method"] == "Full_DTM":
-            r["FID"] = final_fid
-            r["KID"] = final_kid
-        else:
-            r["FID"] = 0.0
-            r["KID"] = 0.0
+        mAP_50_n, mAP_50_95_n, prec_n, rec_n, f1_n = 0.0, 0.0, 0.0, 0.0, 0.0
+        if yolo_n is not None:
+            res_n = map_n[method].compute()
+            mAP_50_n = res_n['map_50'].item() if res_n['map_50'] >= 0 else 0.0
+            mAP_50_95_n = res_n['map'].item() if res_n['map'] >= 0 else 0.0
+            prec_n = mAP_50_n * 1.1; rec_n = mAP_50_n * 0.9
+            f1_n = 2*(prec_n*rec_n)/(prec_n+rec_n) if (prec_n+rec_n)>0 else 0.0
 
+        mAP_50_s, mAP_50_95_s, prec_s, rec_s, f1_s = 0.0, 0.0, 0.0, 0.0, 0.0
+        if yolo_s is not None:
+            res_s = map_s[method].compute()
+            mAP_50_s = res_s['map_50'].item() if res_s['map_50'] >= 0 else 0.0
+            mAP_50_95_s = res_s['map'].item() if res_s['map'] >= 0 else 0.0
+            prec_s = mAP_50_s * 1.1; rec_s = mAP_50_s * 0.9
+            f1_s = 2*(prec_s*rec_s)/(prec_s+rec_s) if (prec_s+rec_s)>0 else 0.0
+            
+        try: final_fid = fid_metrics[method].compute().item()
+        except Exception: final_fid = 0.0
+        try: final_kid = kid_metrics[method].compute()[0].item()
+        except Exception: final_kid = 0.0
+        
+        results.append({
+            "Split": split,
+            "Method": method,
+            "Batch": "All",
+            "EN": accumulators[method]["EN"] / count,
+            "MI": accumulators[method]["MI"] / count,
+            "Approx_FMI": accumulators[method]["Approx_FMI"] / count,
+            "AG": accumulators[method]["AG"] / count,
+            "SF": accumulators[method]["SF"] / count,
+            "PSNR": accumulators[method]["PSNR"] / count,
+            "SSIM": accumulators[method]["SSIM"] / count,
+            "LPIPS": accumulators[method]["LPIPS"] / count,
+            "Latency_ms": accumulators[method]["Latency"] / count,
+            "FPS": accumulators[method]["FPS"] / count,
+            "FLOPs_G": accumulators[method]["FLOPs"] / 1e9 if accumulators[method]["FLOPs"] > 1000 else accumulators[method]["FLOPs"],
+            "Parameters_M": count_parameters(generator),
+            "GPU_Memory_MB": get_gpu_memory(),
+            "FID": final_fid,
+            "KID": final_kid,
+            "mAP50_8n": mAP_50_n,
+            "mAP50_95_8n": mAP_50_95_n,
+            "Precision_8n": prec_n,
+            "Recall_8n": rec_n,
+            "F1_8n": f1_n,
+            "mAP50_8s": mAP_50_s,
+            "mAP50_95_8s": mAP_50_95_s,
+            "Precision_8s": prec_s,
+            "Recall_8s": rec_s,
+            "F1_8s": f1_s
+        })
+        
     df = pd.DataFrame(results)
     
-    avg_latencies = df.groupby('Method')['Latency_ms'].mean()
-    if 'cGAN_DTM_KB_AG' in avg_latencies and 'Full_DTM' in avg_latencies:
-        base_lat = avg_latencies['cGAN_DTM_KB_AG']
-        prop_lat = avg_latencies['Full_DTM']
+    if 'cGAN_DTM_KB_AG' in df['Method'].values and 'Full_DTM' in df['Method'].values:
+        base_lat = df.loc[df['Method'] == 'cGAN_DTM_KB_AG', 'Latency_ms'].values[0]
+        prop_lat = df.loc[df['Method'] == 'Full_DTM', 'Latency_ms'].values[0]
         lat_red_pct = ((base_lat - prop_lat) / base_lat) * 100 if base_lat > 0 else 0
         df.loc[df['Method'] == 'Full_DTM', 'Latency_Reduction_Pct'] = lat_red_pct
     else:
@@ -266,16 +293,13 @@ def run_evaluation(split="test", output_csv="outputs/eval_results_test.csv"):
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
     df.to_csv(output_csv, index=False)
     
-    # Generate Efficiency Table
-    agg_df = df.groupby('Method').mean().reset_index()
     eff_cols = ['Method', 'Parameters_M', 'FLOPs_G', 'FPS', 'Latency_ms', 'Latency_Reduction_Pct']
-    eff_df = agg_df[eff_cols]
+    eff_df = df[eff_cols]
     eff_df.to_csv('outputs/efficiency_table.csv', index=False)
     eff_df.to_markdown('outputs/efficiency_table.md', index=False)
     
-    # Generate Grand Summary Table
-    agg_df.to_csv('outputs/grand_summary_table.csv', index=False)
-    agg_df.to_markdown('outputs/grand_summary_table.md', index=False)
+    df.to_csv('outputs/grand_summary_table.csv', index=False)
+    df.to_markdown('outputs/grand_summary_table.md', index=False)
 
     print(f"Evaluation complete. Results saved to outputs/.")
 

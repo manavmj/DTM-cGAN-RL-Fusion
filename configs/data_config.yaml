@@ -5,7 +5,7 @@
 
 dataset:
   name: "TriModalFusionDataset"
-  root: "C:/Users/Student/Desktop/Coding_results"
+  root: "D:/JRF/implem,emntatiomn opf sic paper cross/data/kaggle/working/tri_modal_dataset"
   train_split: "train"
   val_split: "test"
   test_split: "test"
